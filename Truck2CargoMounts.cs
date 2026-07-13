@@ -93,9 +93,9 @@ namespace LoadoutInjector
                     var vehicleDef = (VehicleDefinition)byNameVehicleDef.Invoke(null, new object[] { variant.Vehicle, StringComparison.InvariantCultureIgnoreCase });
                     if (vehicleDef == null) continue; 
 
-                    var prefab = (GameObject)duplicatePrefab.Invoke(null, new object[] { "HLT-Mx1", mountName });
-                    var info = (WeaponInfo)duplicateWeaponInfo.Invoke(null, new object[] { "HLT-M_info", $"Truck2-{variant.Suffix}_info", null });
-                    mount = (WeaponMount)duplicateWeaponMount.Invoke(null, new object[] { "HLT-Mx1", mountName, prefab, info, vehicleDef });
+                    var prefab = (GameObject)duplicatePrefab.Invoke(null, new object[] { "HLT-Rx1", mountName });
+                    var info = (WeaponInfo)duplicateWeaponInfo.Invoke(null, new object[] { "HLT-R_info", $"Truck2-{variant.Suffix}_info", null });
+                    mount = (WeaponMount)duplicateWeaponMount.Invoke(null, new object[] { "HLT-Rx1", mountName, prefab, info, vehicleDef });
                     addMountToEncyclopedia.Invoke(null, new object[] { __instance, mountName, mount });
 
                     info.weaponName = variant.DisplayName;
