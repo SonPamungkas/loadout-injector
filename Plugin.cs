@@ -12,6 +12,7 @@ namespace LoadoutInjector
         public static ManualLogSource ModLogger;
 
         public static ConfigEntry<bool> Cfg_Integration_LoadoutPresets_Enable;
+        public static ConfigEntry<bool> Cfg_DebugLogging;
 
         private void Awake()
         {
@@ -38,6 +39,9 @@ namespace LoadoutInjector
 
             Cfg_Integration_LoadoutPresets_Enable = Config.Bind(S_INTEGRATIONS, "Loadout Presets UI", true,
                 "Enables the per-aircraft saved presets UI in the hangar.");
+
+            Cfg_DebugLogging = Config.Bind("Debug", "Verbose Logging", false,
+                "Enables extreme logging for troubleshooting. Keep OFF during normal gameplay for maximum performance.");
         }
     }
 }
