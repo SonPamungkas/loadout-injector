@@ -17,13 +17,46 @@ namespace LoadoutInjector
         }
 
         private static bool dictionaryGenerated = false;
-
         internal static string RootDir => Path.Combine(Paths.PluginPath, "loadout-preset");
+
+        public static readonly Dictionary<string, Dictionary<int, List<WeaponMount>>> CachedJsonWeapons = 
+            new Dictionary<string, Dictionary<int, List<WeaponMount>>>();
+
+        public static bool IsCached = false;
+
+        internal static string GetAircraftName(Aircraft aircraft)
+        {
+            if (aircraft == null) return "unknown";
+            string rawName = aircraft.gameObject.name;
+            if (rawName.EndsWith("(Clone)", StringComparison.Ordinal)) 
+                rawName = rawName.Substring(0, rawName.Length - 7);
+
+            string nameToSanitize = string.IsNullOrEmpty(aircraft.unitName) ? rawName : aircraft.unitName;
+            return SanitizeFileName(nameToSanitize);
+        }
 
         private static string SanitizeFileName(string name)
         {
             if (string.IsNullOrEmpty(name)) return "unknown";
-            foreach (char c in Path.GetInvalidFileNameChars())
+
+            char[] invalidChars = Path.GetInvalidFileNameChars();
+            bool needsReplacement = false;
+            for (int i = 0; i < name.Length; i++)
+            {
+                for (int j = 0; j < invalidChars.Length; j++)
+                {
+                    if (name[i] == invalidChars[j])
+                    {
+                        needsReplacement = true;
+                        break;
+                    }
+                }
+                if (needsReplacement) break;
+            }
+
+            if (!needsReplacement) return name;
+
+            foreach (char c in invalidChars)
                 name = name.Replace(c, '_');
             return name;
         }
@@ -31,113 +64,132 @@ namespace LoadoutInjector
         internal static void GenerateDictionary()
         {
             if (dictionaryGenerated) return;
-
             var mounts = Resources.FindObjectsOfTypeAll<WeaponMount>().Where(m => m != null).ToList();
             if (mounts.Count == 0) return;
-
             string dictPath = Path.Combine(RootDir, "hardpointdictionary.log");
             Directory.CreateDirectory(RootDir);
-
-            var lines = new List<string>();
-            lines.Add("=== Weapon Mount Dictionary ===");
-            lines.Add("Use these exact names in your json files:");
-            lines.Add("");
-
+            var lines = new List<string>
+            {
+                "=== Weapon Mount Dictionary ===",
+                "Use these exact names in your json files:",
+                ""
+            };
             foreach (var m in mounts.OrderBy(m => m.name))
             {
                 string key = !string.IsNullOrEmpty(m.jsonKey) ? m.jsonKey : m.name;
                 lines.Add(key);
             }
-
             lines = lines.Distinct().ToList();
-
             File.WriteAllLines(dictPath, lines);
             dictionaryGenerated = true;
-            LoadoutInjectorPlugin.ModLogger.LogInfo($"[JsonInjector] Generated dictionary at {dictPath} with {mounts.Count} mounts.");
+
+            if (LoadoutInjectorPlugin.Cfg_DebugLogging?.Value == true)
+                LoadoutInjectorPlugin.ModLogger.LogInfo($"[JsonInjector] Generated dictionary at {dictPath} with {mounts.Count} mounts.");
         }
 
-        internal static void Inject(WeaponManager wm)
+        private static Dictionary<string, WeaponMount> _allMountsByName = null;
+
+        private static WeaponMount ResolveMount(string name)
         {
-            if (wm == null || wm.hardpointSets == null) return;
+            if (_allMountsByName == null)
+            {
+                _allMountsByName = new Dictionary<string, WeaponMount>();
+                foreach (var m in Resources.FindObjectsOfTypeAll<WeaponMount>())
+                {
+                    if (m != null)
+                    {
+                        _allMountsByName[m.name] = m;
+                        if (!string.IsNullOrEmpty(m.jsonKey))
+                            _allMountsByName[m.jsonKey] = m;
+                    }
+                }
+            }
+            if (Encyclopedia.WeaponLookup != null && Encyclopedia.WeaponLookup.TryGetValue(name, out var encyMount))
+                return encyMount;
 
-            var aircraft = wm.GetComponentInParent<Aircraft>();
-            if (aircraft == null) return;
+            _allMountsByName.TryGetValue(name, out var found);
+            return found;
+        }
 
-            string acName = SanitizeFileName(aircraft.unitName ?? aircraft.name ?? "unknown");
+        public static Dictionary<int, List<WeaponMount>> GetLoadout(string acName, Aircraft aircraft)
+        {
+            if (CachedJsonWeapons.TryGetValue(acName, out var stationDict))
+                return stationDict;
+
+            stationDict = new Dictionary<int, List<WeaponMount>>();
+            CachedJsonWeapons[acName] = stationDict; 
+
             string acDir = Path.Combine(RootDir, acName);
+            if (!Directory.Exists(acDir)) return stationDict;
 
-            if (!Directory.Exists(acDir))
-                Directory.CreateDirectory(acDir);
+            var wm = aircraft.GetComponentInChildren<WeaponManager>(true);
+            if (wm == null || wm.hardpointSets == null) return stationDict;
 
             for (int i = 0; i < wm.hardpointSets.Length; i++)
             {
-                var hs = wm.hardpointSets[i];
-                if (hs == null) continue;
-
+                string hsNameStr = !string.IsNullOrEmpty(wm.hardpointSets[i].name) ? SanitizeFileName(wm.hardpointSets[i].name) : ("weaponstation" + i);
                 string stationDir = Path.Combine(acDir, "weaponstation" + i);
-                if (!Directory.Exists(stationDir))
-                    Directory.CreateDirectory(stationDir);
-
-                string hsNameStr = !string.IsNullOrEmpty(hs.name) ? SanitizeFileName(hs.name) : ("weaponstation" + i);
                 string jsonPath = Path.Combine(stationDir, hsNameStr + ".json");
 
-                if (!File.Exists(jsonPath))
+                if (File.Exists(jsonPath))
                 {
-
-                    var defaults = new WeaponStationOptions();
-                    if (hs.weaponOptions != null)
-                    {
-                        foreach (var opt in hs.weaponOptions)
-                        {
-                            if (opt != null)
-                            {
-                                string key = !string.IsNullOrEmpty(opt.jsonKey) ? opt.jsonKey : opt.name;
-                                defaults.allowedWeapons.Add(key);
-                            }
-                        }
-                    }
-                    string json = JsonUtility.ToJson(defaults, true);
-                    File.WriteAllText(jsonPath, json);
-                }
-                else
-                {
-
                     try
                     {
                         string json = File.ReadAllText(jsonPath);
                         var options = JsonUtility.FromJson<WeaponStationOptions>(json);
-
                         if (options != null && options.allowedWeapons != null)
                         {
                             var newOptions = new List<WeaponMount>();
-                            var allMounts = Resources.FindObjectsOfTypeAll<WeaponMount>();
-
                             foreach (string wName in options.allowedWeapons)
                             {
-                                WeaponMount mount = null;
-
-                                if (Encyclopedia.WeaponLookup != null && Encyclopedia.WeaponLookup.TryGetValue(wName, out var encyMount))
-                                {
-                                    mount = encyMount;
-                                }
-
-                                if (mount == null)
-                                {
-                                    mount = allMounts.FirstOrDefault(m => m != null && (m.name == wName || m.jsonKey == wName));
-                                }
-
-                                if (mount != null)
-                                    newOptions.Add(mount);
-                                else
-                                    LoadoutInjectorPlugin.ModLogger.LogWarning($"[JsonInjector] WeaponMount '{wName}' not found for {acName} station {i}.");
+                                var mount = ResolveMount(wName);
+                                if (mount != null) newOptions.Add(mount);
                             }
-
-                            hs.weaponOptions = newOptions;
+                            if (newOptions.Count > 0)
+                                stationDict[i] = newOptions;
                         }
                     }
                     catch (Exception ex)
                     {
                         LoadoutInjectorPlugin.ModLogger.LogError($"[JsonInjector] Failed to parse JSON at {jsonPath}: {ex.Message}");
+                    }
+                }
+            }
+
+            if (stationDict.Count > 0 && LoadoutInjectorPlugin.Cfg_DebugLogging?.Value == true)
+            {
+                LoadoutInjectorPlugin.ModLogger.LogInfo($"[JsonInjector] Lazy-cached {stationDict.Count} stations for aircraft {acName}");
+            }
+
+            return stationDict;
+        }
+
+        internal static void Inject(WeaponManager wm)
+        {
+            if (wm == null || wm.hardpointSets == null) return;
+            var aircraft = wm.GetComponentInParent<Aircraft>();
+            if (aircraft == null) return;
+            string acName = GetAircraftName(aircraft);
+
+            var dict = GetLoadout(acName, aircraft);
+            if (dict != null && dict.Count > 0)
+            {
+                for (int i = 0; i < wm.hardpointSets.Length; i++)
+                {
+                    var hs = wm.hardpointSets[i];
+                    if (hs == null) continue;
+
+                    if (dict.TryGetValue(i, out var customMounts))
+                    {
+                        var expanded = new List<WeaponMount>(hs.weaponOptions ?? new List<WeaponMount>());
+                        var seen = new HashSet<int>(expanded.Where(x => x != null).Select(x => x.GetInstanceID()));
+
+                        foreach(var mount in customMounts)
+                        {
+                            if (mount != null && seen.Add(mount.GetInstanceID()))
+                                expanded.Add(mount);
+                        }
+                        hs.weaponOptions = expanded;
                     }
                 }
             }
