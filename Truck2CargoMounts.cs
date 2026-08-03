@@ -3,12 +3,8 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using UnityEngine;
-
 namespace LoadoutInjector
 {
-    [HarmonyPatch(typeof(Encyclopedia), "AfterLoad", new Type[] { })]
-    [HarmonyPriority(Priority.Last)]
-    [HarmonyAfter("com.offiry.qol")]
     public static class Truck2CargoMounts_Patch
     {
         private struct VariantInfo
@@ -21,7 +17,6 @@ namespace LoadoutInjector
             public float Cost;
             public string Description;
         }
-
         private static readonly VariantInfo[] Variants = new[]
         {
             new VariantInfo { Suffix = "LADS", Vehicle = "Truck2-LADS", DisplayName = "MSV LADS", ShortName = "MSV LADS", Mass = 15000, Cost = 18.5f,
@@ -46,58 +41,45 @@ namespace LoadoutInjector
                 Description = "Mobile anti-ship missile launcher capable of engaging naval targets at long range." },
             new VariantInfo { Suffix = "ASHM3", Vehicle = "Truck2-ASHM3", DisplayName = "MSV AGM-200B Launcher", ShortName = "MSV AGM-200B", Mass = 18000, Cost = 12.5f,
                 Description = "Mobile anti-ship missile launcher capable of engaging naval targets at extended range." },
+            new VariantInfo { Suffix = "MLRS", Vehicle = "Truck2-MLRS", DisplayName = "MSV MLRS", ShortName = "MSV MLRS", Mass = 18000, Cost = 10.5f,
+                Description = "Support vehicle equipped with a multiple launch rocket system for area bombardment." },
+            new VariantInfo { Suffix = "MRAP", Vehicle = "Truck2-MRAP", DisplayName = "MSV MRAP", ShortName = "MSV MRAP", Mass = 15000, Cost = 2.5f,
+                Description = "Mine-resistant ambush protected support vehicle." },
         };
-
         private static readonly HashSet<string> _created = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        [HarmonyPrefix]
-        public static void Prefix(Encyclopedia __instance)
-        {
-            try { AddMissingMounts(__instance); }
-            catch (Exception ex) { LoadoutInjectorPlugin.ModLogger.LogError("[LoadoutInjector] Truck2CargoMounts failed: " + ex); }
-        }
-
-        private static void AddMissingMounts(Encyclopedia __instance)
+        internal static void AddMissingMounts(Encyclopedia __instance)
         {
             var qolAssembly = AppDomain.CurrentDomain.GetAssemblies()
                 .FirstOrDefault(a => a.GetName().Name == "qol");
             if (qolAssembly == null) return;
             var qolPlugin = qolAssembly.GetType("QOLPlugin");
             if (qolPlugin == null) return;
-
             var duplicatePrefab = AccessTools.Method(qolPlugin, "DuplicatePrefab", new[] { typeof(string), typeof(string) });
             var duplicateWeaponInfo = AccessTools.Method(qolPlugin, "DuplicateWeaponInfo", new[] { typeof(string), typeof(string), typeof(GameObject) });
             var duplicateWeaponMount = AccessTools.Method(qolPlugin, "DuplicateWeaponMount");
             var addMountToEncyclopedia = AccessTools.Method(qolPlugin, "AddMountToEncyclopedia");
-
             var resourceCacheType = qolAssembly.GetType("qol.Utilities.ResourceCache");
             var byNameGeneric = resourceCacheType?.GetMethod("ByName", new[] { typeof(string), typeof(StringComparison) });
             var byNameVehicleDef = byNameGeneric?.MakeGenericMethod(typeof(VehicleDefinition));
-
             if (duplicatePrefab == null || duplicateWeaponInfo == null || duplicateWeaponMount == null
                 || addMountToEncyclopedia == null || byNameVehicleDef == null)
             {
                 LoadoutInjectorPlugin.ModLogger.LogWarning("[LoadoutInjector] Truck2CargoMounts: could not resolve qol helper methods, skipping.");
                 return;
             }
-
             foreach (var variant in Variants)
             {
                 string mountName = $"Truck2-{variant.Suffix}x1";
-
                 WeaponMount mount = __instance.weaponMounts.FirstOrDefault(m => m.name == mountName);
                 if (mount == null)
                 {
                     if (_created.Contains(mountName)) continue; 
-
                     var vehicleDef = (VehicleDefinition)byNameVehicleDef.Invoke(null, new object[] { variant.Vehicle, StringComparison.InvariantCultureIgnoreCase });
                     if (vehicleDef == null) continue; 
-
                     var prefab = (GameObject)duplicatePrefab.Invoke(null, new object[] { "HLT-Rx1", mountName });
                     var info = (WeaponInfo)duplicateWeaponInfo.Invoke(null, new object[] { "HLT-R_info", $"Truck2-{variant.Suffix}_info", null });
                     mount = (WeaponMount)duplicateWeaponMount.Invoke(null, new object[] { "HLT-Rx1", mountName, prefab, info, vehicleDef });
                     addMountToEncyclopedia.Invoke(null, new object[] { __instance, mountName, mount });
-
                     info.weaponName = variant.DisplayName;
                     info.shortName = variant.ShortName;
                     info.massPerRound = variant.Mass;
@@ -105,13 +87,49 @@ namespace LoadoutInjector
                     info.description = variant.Description;
                     mount.mountName = variant.DisplayName;
                     mount.ammo = 1;
-
                     _created.Add(mountName);
                     LoadoutInjectorPlugin.ModLogger.LogInfo($"[LoadoutInjector] Truck2CargoMounts: added {mountName}");
                 }
-
             }
         }
-
+    }
+    [HarmonyPatch(typeof(Encyclopedia), "AfterLoad", new Type[] { typeof(Encyclopedia) })]
+    [HarmonyPriority(Priority.Last)]
+    [HarmonyAfter("com.offiry.qol")]
+    internal static class Truck2CargoMounts_Patch_AfterLoad1
+    {
+        [HarmonyPostfix]
+        static void Postfix(Encyclopedia instance)
+        {
+            try { Truck2CargoMounts_Patch.AddMissingMounts(instance); }
+            catch (Exception ex) { LoadoutInjectorPlugin.ModLogger.LogError("[LoadoutInjector] Truck2CargoMounts AfterLoad1 failed: " + ex); }
+        }
+    }
+    [HarmonyPatch(typeof(Encyclopedia), "AfterLoad", new Type[] { })]
+    [HarmonyPriority(Priority.Last)]
+    [HarmonyAfter("com.offiry.qol")]
+    internal static class Truck2CargoMounts_Patch_AfterLoad2
+    {
+        [HarmonyPostfix]
+        static void Postfix(Encyclopedia __instance)
+        {
+            try { Truck2CargoMounts_Patch.AddMissingMounts(__instance); }
+            catch (Exception ex) { LoadoutInjectorPlugin.ModLogger.LogError("[LoadoutInjector] Truck2CargoMounts AfterLoad2 failed: " + ex); }
+        }
+    }
+    [HarmonyPatch(typeof(GameManager), "SetupGame")]
+    [HarmonyPriority(Priority.Last)]
+    [HarmonyAfter("com.offiry.qol")]
+    internal static class Truck2CargoMounts_Patch_SetupGame
+    {
+        [HarmonyPostfix]
+        static void Postfix()
+        {
+            if (Encyclopedia.i != null)
+            {
+                try { Truck2CargoMounts_Patch.AddMissingMounts(Encyclopedia.i); }
+                catch (Exception ex) { LoadoutInjectorPlugin.ModLogger.LogError("[LoadoutInjector] Truck2CargoMounts SetupGame failed: " + ex); }
+            }
+        }
     }
 }

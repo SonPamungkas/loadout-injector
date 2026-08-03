@@ -2,44 +2,34 @@ using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using HarmonyLib;
-
 namespace LoadoutInjector
 {
-    [BepInPlugin("neutral.loadoutinjector", "Loadout Injector", "1.0.0")]
+    [BepInPlugin("neutral.loadoutinjector", "Loadout Injector", "1.9.9")]
     public class LoadoutInjectorPlugin : BaseUnityPlugin
     {
         public static LoadoutInjectorPlugin Instance;
         public static ManualLogSource ModLogger;
-
         public static ConfigEntry<bool> Cfg_Integration_LoadoutPresets_Enable;
         public static ConfigEntry<bool> Cfg_DebugLogging;
-
         private void Awake()
         {
             Instance = this;
             ModLogger = Logger;
-
             BindConfigs();
-
             var harmony = new Harmony("neutral.loadoutinjector");
             harmony.PatchAll();
-
-            ModLogger.LogInfo("Loadout Injector (Universal JSON) loaded.");
+            ModLogger.LogInfo("Loadout Injector loaded.");
         }
-
         private void OnGUI()
         {
             if (Cfg_Integration_LoadoutPresets_Enable?.Value == true)
                 LoadoutPresets.PresetMenuUI.Draw();
         }
-
         private void BindConfigs()
         {
             const string S_INTEGRATIONS = "Integrations";
-
             Cfg_Integration_LoadoutPresets_Enable = Config.Bind(S_INTEGRATIONS, "Loadout Presets UI", true,
                 "Enables the per-aircraft saved presets UI in the hangar.");
-
             Cfg_DebugLogging = Config.Bind("Debug", "Verbose Logging", false,
                 "Enables extreme logging for troubleshooting. Keep OFF during normal gameplay for maximum performance.");
         }
