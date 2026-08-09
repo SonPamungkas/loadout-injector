@@ -3,6 +3,8 @@ A loadout injection framework for Nuclear Option. Allows user to freely override
 <img width="1357" height="765" alt="Injector2" src="https://github.com/user-attachments/assets/70b491d2-5ed3-49a3-8a52-921c8094b7bb" />
 
 ## Tutorial (BIG W from @Grevoah)
+Step 0: Install to plugins folder along with all other modded aircraft & weapon, go to free flight and preview all aircraft (clicking the aircraft icons one by one)
+
 Step 1: check how many hardpoints a craft has (if it is greyed out or has a button to split it from left and right, make sure to have them all visible)
 
 Step 2: Find the Aircraft folder in the mod folder (The name of the aircraft folder is different to the actual name of it,
