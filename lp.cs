@@ -9,6 +9,9 @@ using BepInEx.Configuration;
 using BepInEx.Logging;
 using HarmonyLib;
 using UnityEngine;
+using UnityEngine.UI;
+using NuclearOption.SavedMission;
+using NuclearOption.Networking;
 using LoadoutInjector;
 namespace LoadoutPresets
 {
@@ -24,6 +27,103 @@ namespace LoadoutPresets
             AccessTools.FieldRefAccess<AircraftSelectionMenu, Aircraft>("previewAircraft");
         internal static readonly AccessTools.FieldRef<AircraftSelectionMenu, LoadoutSelector> LoadoutSelectorRef =
             AccessTools.FieldRefAccess<AircraftSelectionMenu, LoadoutSelector>("loadoutSelector");
+        internal static readonly AccessTools.FieldRef<AircraftSelectionMenu, Slider> MenuFuelSlider =
+            AccessTools.FieldRefAccess<AircraftSelectionMenu, Slider>("fuelLevel");
+        internal static readonly AccessTools.FieldRef<LoadoutSelector, Slider> LoadoutFuelSlider =
+            AccessTools.FieldRefAccess<LoadoutSelector, Slider>("fuelLevel");
+        internal static readonly AccessTools.FieldRef<LoadoutSelector, FactionHQ> SelectorHQ =
+            AccessTools.FieldRefAccess<LoadoutSelector, FactionHQ>("hq");
+        internal static readonly AccessTools.FieldRef<LoadoutSelector, Airbase> SelectorAirbase =
+            AccessTools.FieldRefAccess<LoadoutSelector, Airbase>("airbase");
+    }
+    internal static class AiLoadoutPool
+    {
+        private static readonly Dictionary<string, List<StandardLoadout>> _cache =
+            new Dictionary<string, List<StandardLoadout>>(StringComparer.Ordinal);
+        internal static void ClearCache() { _cache.Clear(); }
+        internal static List<StandardLoadout> Compose(AircraftDefinition def)
+        {
+            if (def == null) return null;
+            string acName = JsonLoadoutInjector.GetAircraftName(def);
+            List<StandardLoadout> cached;
+            if (_cache.TryGetValue(acName, out cached)) return cached;
+            var built = new List<StandardLoadout>();
+            _cache[acName] = built; 
+            if (def.unitPrefab == null) return built;
+            var prefabAircraft = def.unitPrefab.GetComponent<Aircraft>();
+            var wm = prefabAircraft != null ? prefabAircraft.weaponManager : null;
+            if (wm == null || wm.hardpointSets == null) return built;
+            string dir = PresetIO.AircraftDir(def);
+            if (!Directory.Exists(dir)) return built;
+            var stationAllow = JsonLoadoutInjector.GetLoadout(acName, prefabAircraft);
+            var sets = wm.hardpointSets;
+            foreach (string file in Directory.GetFiles(dir, "*.preset"))
+            {
+                try
+                {
+                    var parsed = PresetIO.ParseJson(File.ReadAllText(file));
+                    var chosen = new WeaponMount[sets.Length];
+                    string invalidReason = null;
+                    for (int i = 0; i < sets.Length && invalidReason == null; i++)
+                    {
+                        if (sets[i] == null) continue;
+                        string key = PresetIO.KeyForStation(parsed, sets, i);
+                        if (string.IsNullOrEmpty(key)) continue;
+                        WeaponMount mount = JsonLoadoutInjector.ResolveMount(key);
+                        if (mount == null)
+                        {
+                            invalidReason = $"'{key}' on {PresetIO.StationKey(sets, i)} no longer exists";
+                            break;
+                        }
+                        List<WeaponMount> allowed;
+                        if (stationAllow != null && stationAllow.TryGetValue(i, out allowed)
+                            && !JsonLoadoutInjector.IsMountAllowed(sets[i], allowed, mount))
+                        {
+                            invalidReason = $"'{key}' is not in {PresetIO.StationKey(sets, i)}'s json";
+                            break;
+                        }
+                        chosen[i] = mount;
+                    }
+                    if (invalidReason != null)
+                    {
+                        if (LoadoutInjectorPlugin.Cfg_DebugLogging?.Value == true)
+                            LoadoutInjectorPlugin.ModLogger.LogInfo(
+                                $"[Presets] AI pool: dropped '{Path.GetFileNameWithoutExtension(file)}' for {acName} - {invalidReason}.");
+                        continue;
+                    }
+                    var precluded = new HashSet<int>();
+                    for (int i = 0; i < sets.Length; i++)
+                    {
+                        if (chosen[i] == null || sets[i] == null) continue;
+                        if (sets[i].precludingHardpointSets == null) continue;
+                        foreach (byte idx in sets[i].precludingHardpointSets) precluded.Add(idx);
+                    }
+                    var loadout = new Loadout { weapons = new List<WeaponMount>(sets.Length) };
+                    for (int i = 0; i < sets.Length; i++)
+                        loadout.weapons.Add(precluded.Contains(i) ? null : chosen[i]);
+                    built.Add(new StandardLoadout
+                    {
+                        disabled = false,
+                        Name = Path.GetFileNameWithoutExtension(file),
+                        loadout = loadout,
+                        FuelRatio = PresetIO.ResolveFuel(parsed, def)
+                    });
+                }
+                catch (Exception ex)
+                {
+                    LoadoutInjectorPlugin.ModLogger.LogWarning("[Presets] Could not compose " + file + ": " + ex.Message);
+                }
+            }
+            return built;
+        }
+        internal static bool SameMounts(Loadout a, Loadout b)
+        {
+            if (a == null || b == null || a.weapons == null || b.weapons == null) return false;
+            if (a.weapons.Count != b.weapons.Count) return false;
+            for (int i = 0; i < a.weapons.Count; i++)
+                if (a.weapons[i] != b.weapons[i]) return false;
+            return true;
+        }
     }
     internal static class PresetIO
     {
@@ -33,18 +133,52 @@ namespace LoadoutPresets
             preset = Regex.Replace((preset ?? "").Trim(), @"[=\r\n\t\\\""'\[\]]", "_");
             return preset.Length == 0 ? Plugin.DEFAULTPRESET : preset;
         }
-        private static string SanitizeFileName(string name)
+        internal static string RootDir => JsonLoadoutInjector.RootDir;
+        private static string LegacyRootDir => Path.Combine(Paths.PluginPath, "loadout-preset");
+        internal static string AircraftDir(AircraftDefinition def)
+        {
+            MigrateLegacyTree();
+            return Path.Combine(RootDir, JsonLoadoutInjector.GetAircraftName(def));
+        }
+        internal static string PresetFilePath(AircraftDefinition def, string preset) =>
+            Path.Combine(AircraftDir(def), SanitizeName(Norm(preset)) + ".preset");
+        private static string SanitizeName(string name)
         {
             name = name ?? "";
             foreach (char c in Path.GetInvalidFileNameChars())
                 name = name.Replace(c, '_');
             return name;
         }
-        internal static string RootDir => Path.Combine(Paths.PluginPath, "loadout-preset");
-        internal static string AircraftDir(AircraftDefinition def) =>
-            Path.Combine(RootDir, SanitizeFileName(def.jsonKey ?? def.unitName ?? "unknown"));
-        internal static string PresetFilePath(AircraftDefinition def, string preset) =>
-            Path.Combine(AircraftDir(def), SanitizeFileName(Norm(preset)) + ".preset");
+        private static bool _migrated;
+        private static void MigrateLegacyTree()
+        {
+            if (_migrated) return;
+            _migrated = true;
+            try
+            {
+                string legacy = LegacyRootDir;
+                if (!Directory.Exists(legacy)) return;
+                int moved = 0;
+                foreach (string acDir in Directory.GetDirectories(legacy))
+                {
+                    string target = Path.Combine(RootDir, Path.GetFileName(acDir));
+                    foreach (string file in Directory.GetFiles(acDir, "*.preset"))
+                    {
+                        string dest = Path.Combine(target, Path.GetFileName(file));
+                        if (File.Exists(dest)) continue; 
+                        Directory.CreateDirectory(target);
+                        File.Move(file, dest);
+                        moved++;
+                    }
+                }
+                if (moved > 0)
+                    LoadoutInjectorPlugin.ModLogger.LogInfo($"[Presets] Migrated {moved} preset(s) from loadout-preset into preset-loadout.");
+            }
+            catch (Exception ex)
+            {
+                LoadoutInjectorPlugin.ModLogger.LogWarning("[Presets] Legacy preset migration failed: " + ex.Message);
+            }
+        }
         private static ConfigEntry<T> Entry<T>(string section, string key, T def) =>
             LoadoutInjectorPlugin.Instance.Config.Bind(section, key, def);
         private static T Get<T>(string section, string key, T def) => Entry(section, key, def).Value;
@@ -114,11 +248,30 @@ namespace LoadoutPresets
         }
         private static string EscapeJson(string s) => (s ?? "").Replace("\\", "\\\\").Replace("\"", "\\\"");
         private static string UnescapeJson(string s) => (s ?? "").Replace("\\\"", "\"").Replace("\\\\", "\\");
-        private static string BuildJson(float fuel, string livery, List<string> hardpoints)
+        internal static string StationKey(HardpointSet[] sets, int i)
+        {
+            if (sets == null || i < 0 || i >= sets.Length) return "#" + i;
+            string name = sets[i]?.name;
+            if (string.IsNullOrEmpty(name)) return "#" + i;
+            int seen = 0;
+            for (int j = 0; j < sets.Length; j++)
+                if (sets[j] != null && sets[j].name == name) seen++;
+            return seen > 1 ? name + "#" + i : name;
+        }
+        private static string BuildJson(float fuel, string livery, List<string> hardpoints,
+                                        List<string> stations, bool vanilla)
         {
             var sb = new System.Text.StringBuilder();
             sb.Append("{\"Fuel\":").Append(fuel.ToString(System.Globalization.CultureInfo.InvariantCulture));
             sb.Append(",\"Livery\":\"").Append(EscapeJson(livery)).Append("\"");
+            if (vanilla) sb.Append(",\"Vanilla\":1");
+            sb.Append(",\"Stations\":[");
+            for (int i = 0; i < stations.Count; i++)
+            {
+                if (i > 0) sb.Append(",");
+                sb.Append("\"").Append(EscapeJson(stations[i])).Append("\"");
+            }
+            sb.Append("]");
             sb.Append(",\"Hardpoints\":[");
             for (int i = 0; i < hardpoints.Count; i++)
             {
@@ -128,29 +281,49 @@ namespace LoadoutPresets
             sb.Append("]}");
             return sb.ToString();
         }
-        private struct ParsedPreset
+        internal struct ParsedPreset
         {
             public float Fuel;
             public string Livery;
-            public List<string> Hardpoints;
+            public bool Vanilla;
+            public List<string> Hardpoints;              
+            public Dictionary<string, string> Stations;  
         }
-        private static ParsedPreset ParseJson(string json)
+        private static List<string> ReadStringArray(string json, string field)
         {
-            var result = new ParsedPreset { Fuel = 1f, Livery = "", Hardpoints = new List<string>() };
+            var list = new List<string>();
+            var m = Regex.Match(json, @"""" + field + @"""\s*:\s*\[(.*?)\]", RegexOptions.Singleline);
+            if (!m.Success) return list;
+            foreach (Match e in Regex.Matches(m.Groups[1].Value, @"""([^""]*)"""))
+                list.Add(UnescapeJson(e.Groups[1].Value));
+            return list;
+        }
+        internal static ParsedPreset ParseJson(string json)
+        {
+            var result = new ParsedPreset
+            {
+                Fuel = 1f,
+                Livery = "",
+                Vanilla = false,
+                Hardpoints = new List<string>(),
+                Stations = new Dictionary<string, string>(StringComparer.Ordinal)
+            };
             if (string.IsNullOrEmpty(json)) return result;
             try
             {
-                var fuelMatch = Regex.Match(json, "\"Fuel\"\\s*:\\s*([0-9.eE+-]+)");
+                var fuelMatch = Regex.Match(json, @"""Fuel""\s*:\s*([0-9.eE+-]+)");
                 if (fuelMatch.Success)
                     result.Fuel = float.Parse(fuelMatch.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture);
-                var liveryMatch = Regex.Match(json, "\"Livery\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
+                var liveryMatch = Regex.Match(json, @"""Livery""\s*:\s*""([^""]*)""");
                 if (liveryMatch.Success)
                     result.Livery = UnescapeJson(liveryMatch.Groups[1].Value);
-                var hpMatch = Regex.Match(json, "\"Hardpoints\"\\s*:\\s*\\[(.*?)\\]", RegexOptions.Singleline);
-                if (hpMatch.Success)
+                result.Vanilla = Regex.IsMatch(json, @"""Vanilla""\s*:\s*(1|true)", RegexOptions.IgnoreCase);
+                result.Hardpoints = ReadStringArray(json, "Hardpoints");
+                foreach (string entry in ReadStringArray(json, "Stations"))
                 {
-                    foreach (Match m in Regex.Matches(hpMatch.Groups[1].Value, "\"((?:[^\"\\\\]|\\\\.)*)\""))
-                        result.Hardpoints.Add(UnescapeJson(m.Groups[1].Value));
+                    int eq = entry.IndexOf('=');
+                    if (eq <= 0) continue;
+                    result.Stations[entry.Substring(0, eq)] = entry.Substring(eq + 1);
                 }
             }
             catch (Exception ex)
@@ -159,6 +332,24 @@ namespace LoadoutPresets
             }
             return result;
         }
+        internal static string KeyForStation(ParsedPreset parsed, HardpointSet[] sets, int i)
+        {
+            if (parsed.Stations != null && parsed.Stations.Count > 0)
+            {
+                string byName;
+                if (parsed.Stations.TryGetValue(StationKey(sets, i), out byName)) return byName;
+                if (sets != null && i < sets.Length && sets[i] != null
+                    && parsed.Stations.TryGetValue(sets[i].name ?? "", out byName)) return byName;
+                return "";
+            }
+            return (parsed.Hardpoints != null && i < parsed.Hardpoints.Count) ? parsed.Hardpoints[i] : "";
+        }
+        internal static float ResolveFuel(ParsedPreset parsed, AircraftDefinition def)
+        {
+            if (parsed.Fuel > 0f) return parsed.Fuel;
+            var ap = def?.aircraftParameters;
+            return ap != null ? ap.DefaultFuelLevel : 1f;
+        }
         internal static void SaveCurrentToPreset(AircraftSelectionMenu menu, AircraftDefinition def, string preset)
         {
             preset = Norm(preset);
@@ -166,26 +357,102 @@ namespace LoadoutPresets
             var loadoutSelector = MenuRefs.LoadoutSelectorRef(menu);
             var weaponSelectors = MenuRefs.WeaponSelectors(loadoutSelector);
             var preview = MenuRefs.PreviewAircraft(menu);
+            var sets = preview?.weaponManager?.hardpointSets;
             var hardpoints = new List<string>(weaponSelectors.Count);
+            var stations = new List<string>(weaponSelectors.Count);
             for (int i = 0; i < weaponSelectors.Count; i++)
             {
                 WeaponMount mount = weaponSelectors[i].GetValue();
-                hardpoints.Add(mount?.jsonKey ?? "");
+                string key = mount != null ? (JsonLoadoutInjector.PreferredKey(mount) ?? "") : "";
+                hardpoints.Add(key);
+                stations.Add(StationKey(sets, i) + "=" + key);
             }
-            float fuel = preview != null ? preview.fuelLevel : 1f;
+            float fuel = ReadFuel(menu, loadoutSelector);
             string livery = preview != null ? SerializeLiveryKey(preview.NetworkLiveryKey) : "";
-            string dir = AircraftDir(def);
-            Directory.CreateDirectory(dir);
-            File.WriteAllText(PresetFilePath(def, preset), BuildJson(fuel, livery, hardpoints));
+            string path = PresetFilePath(def, preset);
+            bool vanilla = File.Exists(path) && ParseJson(File.ReadAllText(path)).Vanilla;
+            Directory.CreateDirectory(AircraftDir(def));
+            File.WriteAllText(path, BuildJson(fuel, livery, hardpoints, stations, vanilla));
         }
+        private static float ReadFuel(AircraftSelectionMenu menu, LoadoutSelector selector)
+        {
+            try
+            {
+                var slider = menu != null ? MenuRefs.MenuFuelSlider(menu) : null;
+                if (slider != null) return slider.value;
+                var alt = selector != null ? MenuRefs.LoadoutFuelSlider(selector) : null;
+                if (alt != null) return alt.value;
+            }
+            catch (Exception ex)
+            {
+                LoadoutInjectorPlugin.ModLogger.LogWarning("[Presets] Could not read the fuel slider: " + ex.Message);
+            }
+            return 1f;
+        }
+        private static void WriteFuel(AircraftSelectionMenu menu, LoadoutSelector selector, float fuel)
+        {
+            try
+            {
+                var slider = menu != null ? MenuRefs.MenuFuelSlider(menu) : null;
+                if (slider != null) slider.value = fuel;
+                var alt = selector != null ? MenuRefs.LoadoutFuelSlider(selector) : null;
+                if (alt != null && alt != slider) alt.value = fuel;
+            }
+            catch (Exception ex)
+            {
+                LoadoutInjectorPlugin.ModLogger.LogWarning("[Presets] Could not set the fuel slider: " + ex.Message);
+            }
+        }
+        internal static List<string> LastSkipped = new List<string>();
         internal static bool LoadPreset(AircraftSelectionMenu menu, AircraftDefinition def, string preset)
         {
             preset = Norm(preset);
+            LastSkipped = new List<string>();
             bool applied = ApplyPreset(menu, def, preset);
             SetActivePreset(def, preset);
             LoadoutInjectorPlugin.Instance.Config.Save();
-            LoadoutInjectorPlugin.ModLogger.LogInfo($"[Presets] Loaded {preset}:{def.unitName} {(applied ? "" : "(no saved preset yet)")} ");
+            string note = LastSkipped.Count > 0 ? $" ({LastSkipped.Count} station(s) unavailable)" : "";
+            LoadoutInjectorPlugin.ModLogger.LogInfo($"[Presets] Loaded {preset}:{def.unitName}{note} {(applied ? "" : "(no saved preset yet)")} ");
             return applied;
+        }
+        [ThreadStatic] private static List<WeaponMount> _availableCache;
+        internal static WeaponMount ResolveForStation(HardpointSet hs, string key, LoadoutSelector selector,
+                                                      out string reason)
+        {
+            reason = null;
+            if (hs == null || string.IsNullOrEmpty(key)) return null;
+            var mount = JsonLoadoutInjector.ResolveMount(key);
+            if (mount == null && hs.weaponOptions != null)
+                mount = hs.weaponOptions.Find(w => w != null && (w.jsonKey == key || w.name == key));
+            if (mount == null)
+            {
+                reason = "no longer exists";
+                return null;
+            }
+            if (hs.weaponOptions == null || !hs.weaponOptions.Contains(mount))
+            {
+                reason = "not in this station's json";
+                return null;
+            }
+            if (_availableCache == null) _availableCache = new List<WeaponMount>();
+            FactionHQ hq = null;
+            Airbase airbase = null;
+            if (selector != null)
+            {
+                try { hq = MenuRefs.SelectorHQ(selector); airbase = MenuRefs.SelectorAirbase(selector); }
+                catch { }
+            }
+            Player localPlayer = null;
+            if (GameManager.gameState != GameState.Editor)
+                GameManager.GetLocalPlayer<Player>(out localPlayer);
+            else
+                hq = null; 
+            WeaponChecker.GetAvailableWeaponsNonAlloc(localPlayer, hs, airbase, hq, false, _availableCache);
+            if (_availableCache.Contains(mount)) return mount;
+            reason = (hq != null && hq.restrictedWeapons != null && hq.restrictedWeapons.Contains(mount.name))
+                ? "restricted this mission"
+                : "unavailable here";
+            return null;
         }
         internal static bool ApplyPreset(AircraftSelectionMenu menu, AircraftDefinition def, string preset)
         {
@@ -205,16 +472,27 @@ namespace LoadoutPresets
             ParsedPreset parsed = ParseJson(File.ReadAllText(path));
             var weaponSelectors = MenuRefs.WeaponSelectors(loadSelect);
             int n = Math.Min(weaponSelectors.Count, sets.Length);
+            var skipped = new List<string>();
             for (int i = 0; i < n; i++)
             {
-                string key = i < parsed.Hardpoints.Count ? parsed.Hardpoints[i] : "";
-                weaponSelectors[i].SetValue(
-                    string.IsNullOrEmpty(key)
-                        ? null
-                        : sets[i].weaponOptions.Find(w => w != null && w.jsonKey == key)
-                );
+                string key = KeyForStation(parsed, sets, i);
+                WeaponMount mount = null;
+                if (!string.IsNullOrEmpty(key))
+                {
+                    string reason;
+                    mount = ResolveForStation(sets[i], key, loadSelect, out reason);
+                    if (mount == null && reason != null)
+                        skipped.Add($"{StationKey(sets, i)}: '{key}' {reason}");
+                }
+                weaponSelectors[i].SetValue(mount);
             }
-            preview.fuelLevel = parsed.Fuel;
+            LastSkipped = skipped;
+            if (skipped.Count > 0 && LoadoutInjectorPlugin.Cfg_DebugLogging?.Value == true)
+            {
+                foreach (string line in skipped)
+                    LoadoutInjectorPlugin.ModLogger.LogInfo($"[Presets] {preset}:{def.unitName} skipped {line}");
+            }
+            WriteFuel(menu, loadSelect, ResolveFuel(parsed, def));
             if (!string.IsNullOrEmpty(parsed.Livery))
             {
                 object restored = DeserializeLiveryKey(preview.NetworkLiveryKey.GetType(), parsed.Livery);
@@ -239,11 +517,85 @@ namespace LoadoutPresets
             var method = typeof(AircraftSelectionMenu).GetMethod("AircraftSelectionMenu_OnChange",BindingFlags.NonPublic | BindingFlags.Instance);
             method?.Invoke(menu, null);
         }
+        internal static bool IsVanilla(AircraftDefinition def, string preset)
+        {
+            try
+            {
+                string path = PresetFilePath(def, Norm(preset));
+                return File.Exists(path) && ParseJson(File.ReadAllText(path)).Vanilla;
+            }
+            catch { return false; }
+        }
+        internal static int DumpVanillaForAircraft(AircraftDefinition def, bool force)
+        {
+            if (def == null) return 0;
+            bool verbose = LoadoutInjectorPlugin.Cfg_DebugLogging?.Value == true;
+            string label = def.unitName ?? def.jsonKey ?? "unknown";
+            var ap = def.aircraftParameters;
+            if (ap == null || ap.StandardLoadouts == null || ap.StandardLoadouts.Length == 0)
+            {
+                if (verbose)
+                    LoadoutInjectorPlugin.ModLogger.LogInfo($"[Presets] {label}: no StandardLoadouts to dump.");
+                return 0;
+            }
+            var acPrefab = def.unitPrefab != null ? def.unitPrefab.GetComponent<Aircraft>() : null;
+            if (acPrefab == null) acPrefab = def.unitPrefab != null ? def.unitPrefab.GetComponentInChildren<Aircraft>(true) : null;
+            var wm = acPrefab != null ? acPrefab.weaponManager : null;
+            if (wm == null && acPrefab != null) wm = acPrefab.GetComponentInChildren<WeaponManager>(true);
+            var sets = wm != null ? wm.hardpointSets : null;
+            if (sets == null)
+            {
+                if (verbose)
+                    LoadoutInjectorPlugin.ModLogger.LogInfo($"[Presets] {label}: prefab has no Aircraft/WeaponManager; cannot dump {ap.StandardLoadouts.Length} loadout(s).");
+                return 0;
+            }
+            int written = 0, skipped = 0;
+            foreach (StandardLoadout sl in ap.StandardLoadouts)
+            {
+                if (sl == null || sl.loadout == null || sl.loadout.weapons == null) continue;
+                string name = Norm(string.IsNullOrWhiteSpace(sl.Name) ? "Standard" : sl.Name);
+                if (name == Plugin.DEFAULTPRESET) name = "Standard";
+                string path = PresetFilePath(def, name);
+                if (File.Exists(path))
+                {
+                    if (!ParseJson(File.ReadAllText(path)).Vanilla) { skipped++; continue; } 
+                    if (!force) continue;                                                    
+                }
+                var hardpoints = new List<string>(sets.Length);
+                var stations = new List<string>(sets.Length);
+                for (int i = 0; i < sets.Length; i++)
+                {
+                    WeaponMount mount = i < sl.loadout.weapons.Count ? sl.loadout.weapons[i] : null;
+                    string key = mount != null ? (JsonLoadoutInjector.PreferredKey(mount) ?? "") : "";
+                    hardpoints.Add(key);
+                    stations.Add(StationKey(sets, i) + "=" + key);
+                }
+                float fuel = sl.FuelRatio > 0f ? sl.FuelRatio
+                           : (ap.DefaultFuelLevel > 0f ? ap.DefaultFuelLevel : 1f);
+                Directory.CreateDirectory(AircraftDir(def));
+                File.WriteAllText(path, BuildJson(fuel, "", hardpoints, stations, true));
+                written++;
+            }
+            if (verbose && (written > 0 || skipped > 0))
+                LoadoutInjectorPlugin.ModLogger.LogInfo($"[Presets] {label}: {written} vanilla loadout(s) written, {skipped} skipped (player-owned).");
+            return written;
+        }
+        internal static int DumpVanillaAILoadouts(bool force)
+        {
+            int written = 0;
+            var list = Encyclopedia.i != null ? Encyclopedia.i.aircraft : null;
+            if (list == null) return 0;
+            foreach (AircraftDefinition def in list)
+                written += DumpVanillaForAircraft(def, force);
+            if (written > 0)
+                LoadoutInjectorPlugin.ModLogger.LogInfo("[Presets] Dumped " + written + " vanilla AI loadout(s).");
+            return written;
+        }
         internal static void DeletePreset(AircraftDefinition def, string preset)
         {
             preset = Norm(preset);
-            if (preset == Plugin.DEFAULTPRESET)
-                return;
+            if (preset == Plugin.DEFAULTPRESET) return;
+            if (IsVanilla(def, preset)) return; 
             string path = PresetFilePath(def, preset);
             if (File.Exists(path))
                 File.Delete(path);
@@ -256,6 +608,7 @@ namespace LoadoutPresets
             oldPreset = Norm(oldPreset);
             newPreset = Norm(newPreset);
             if (oldPreset == Plugin.DEFAULTPRESET || newPreset == Plugin.DEFAULTPRESET) return;
+            if (IsVanilla(def, oldPreset)) return;
             if (string.Equals(oldPreset, newPreset, StringComparison.Ordinal)) return;
             string oldPath = PresetFilePath(def, oldPreset);
             if (!File.Exists(oldPath)) return;
@@ -322,11 +675,16 @@ namespace LoadoutPresets
             var parsed = ParseJson(File.ReadAllText(path));
             System.Text.StringBuilder sb = new System.Text.StringBuilder();
             sb.AppendLine($"Preset: {preset}");
-            sb.AppendLine($"Fuel: {(int)(parsed.Fuel * 100f)}%");
+            sb.AppendLine($"Fuel: {(int)(ResolveFuel(parsed, def) * 100f)}%");
             if (!string.IsNullOrEmpty(parsed.Livery))
                 sb.AppendLine("Livery: custom");
+            if (parsed.Vanilla)
+                sb.AppendLine("Source: game default (editable, not deletable)");
             var counts = new Dictionary<string, int>();
-            foreach (string key in parsed.Hardpoints)
+            var keys = (parsed.Hardpoints != null && parsed.Hardpoints.Count > 0)
+                ? parsed.Hardpoints
+                : new List<string>(parsed.Stations.Values);
+            foreach (string key in keys)
             {
                 if (string.IsNullOrEmpty(key))
                     continue;
@@ -498,7 +856,8 @@ namespace LoadoutPresets
                         LoadoutInjectorPlugin.ModLogger.LogInfo($"[Presets] Added {def.unitName} / {name}");
                     }
                 }
-                GUI.enabled = !string.IsNullOrWhiteSpace(_selected) && _selected != Plugin.DEFAULTPRESET;
+                bool protectedPreset = _selected == Plugin.DEFAULTPRESET || PresetIO.IsVanilla(def, _selected);
+                GUI.enabled = !string.IsNullOrWhiteSpace(_selected);
                 if (GUILayout.Button("Overwrite"))
                 {
                     string target = (_selected ?? "").Trim();
@@ -509,6 +868,7 @@ namespace LoadoutPresets
                         LoadoutInjectorPlugin.ModLogger.LogInfo($"[Presets] Overwrote {def.unitName}:{target}");
                     }
                 }
+                GUI.enabled = !string.IsNullOrWhiteSpace(_selected) && !protectedPreset;
                 if (GUILayout.Button("Rename"))
                 {
                     string current = (_selected ?? "").Trim();
@@ -539,6 +899,15 @@ namespace LoadoutPresets
                 GUI.enabled = true;
                 GUILayout.EndHorizontal();
                 GUILayout.BeginHorizontal();
+                if (GUILayout.Button(new GUIContent("Dump Vanilla",
+                        "Writes every aircraft authored AI loadouts here so they can be edited. AI draws from these too."),
+                    GUILayout.Width(110f)))
+                {
+                    int n = PresetIO.DumpVanillaAILoadouts(true);
+                    JsonLoadoutInjector.ClearCache();
+                    Dirty = true;
+                    LoadoutInjectorPlugin.ModLogger.LogInfo("[Presets] Dump Vanilla wrote " + n + " loadout(s).");
+                }
                 GUILayout.FlexibleSpace();
                 if (GUILayout.Button("Done", GUILayout.Width(70f)))
                 {

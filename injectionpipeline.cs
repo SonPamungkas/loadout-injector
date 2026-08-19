@@ -40,70 +40,74 @@ namespace LoadoutInjector
             static void Prefix(object[] __args, out PatchState __state)
             {
                 __state = null;
-                bool verbose = LoadoutInjectorPlugin.Cfg_DebugLogging?.Value == true;
-                HardpointSet hardpointSet = null;
-                if (__args != null)
+                try
                 {
-                    for (int i = 0; i < __args.Length; i++)
+                    bool verbose = LoadoutInjectorPlugin.Cfg_DebugLogging?.Value == true;
+                    HardpointSet hardpointSet = null;
+                    if (__args != null)
                     {
-                        if (__args[i] is HardpointSet hs)
+                        for (int i = 0; i < __args.Length; i++)
                         {
-                            hardpointSet = hs;
-                            break;
-                        }
-                    }
-                }
-                if (hardpointSet == null) return;
-                if (!_hsCache.TryGetValue(hardpointSet, out HsCacheInfo info))
-                {
-                    info = new HsCacheInfo { IsResolved = true, CustomMounts = null };
-                    if (hardpointSet.hardpoints != null && hardpointSet.hardpoints.Count > 0 && hardpointSet.hardpoints[0].part != null)
-                    {
-                        var aircraft = hardpointSet.hardpoints[0].part.gameObject.GetComponentInParent<Aircraft>();
-                        if (aircraft != null)
-                        {
-                            string acName = GetCachedAircraftName(aircraft);
-                            int stationIndex = -1;
-                            if (aircraft.weaponManager != null && aircraft.weaponManager.hardpointSets != null)
+                            if (__args[i] is HardpointSet hs)
                             {
-                                for (int i = 0; i < aircraft.weaponManager.hardpointSets.Length; i++)
-                                {
-                                    if (aircraft.weaponManager.hardpointSets[i] == hardpointSet)
-                                    {
-                                        stationIndex = i;
-                                        break;
-                                    }
-                                }
-                            }
-                            if (stationIndex != -1)
-                            {
-                                var dict = JsonLoadoutInjector.GetLoadout(acName, aircraft);
-                                if (dict != null && dict.TryGetValue(stationIndex, out var customMounts))
-                                {
-                                    if (customMounts != null && customMounts.Count > 0)
-                                    {
-                                        info.CustomMounts = customMounts;
-                                        if (verbose) LoadoutInjectorPlugin.ModLogger.LogInfo($"[InjectionPipeline] GetAvailableWeaponsNonAlloc: Discovered {customMounts.Count} custom mounts for station {stationIndex}. Caching result.");
-                                    }
-                                }
+                                hardpointSet = hs;
+                                break;
                             }
                         }
                     }
-                    _hsCache.Add(hardpointSet, info);
-                }
-                if (info.CustomMounts != null && info.CustomMounts.Count > 0)
-                {
-                    List<WeaponMount> original = hardpointSet.weaponOptions;
-                    if (original == null) original = new List<WeaponMount>();
-                    List<WeaponMount> expanded = new List<WeaponMount>(original);
-                    HashSet<int> seen = new HashSet<int>(original.Where(x => x != null).Select(x => x.GetInstanceID()));
-                    foreach (WeaponMount wm in info.CustomMounts)
+                    if (hardpointSet == null) return;
+                    if (!_hsCache.TryGetValue(hardpointSet, out HsCacheInfo info))
                     {
-                        if (wm != null && seen.Add(wm.GetInstanceID()))
-                            expanded.Add(wm);
+                        info = new HsCacheInfo { IsResolved = true, CustomMounts = null };
+                        if (hardpointSet.hardpoints != null && hardpointSet.hardpoints.Count > 0 && hardpointSet.hardpoints[0].part != null)
+                        {
+                            var aircraft = hardpointSet.hardpoints[0].part.gameObject.GetComponentInParent<Aircraft>();
+                            if (aircraft != null)
+                            {
+                                string acName = GetCachedAircraftName(aircraft);
+                                int stationIndex = -1;
+                                if (aircraft.weaponManager != null && aircraft.weaponManager.hardpointSets != null)
+                                {
+                                    for (int i = 0; i < aircraft.weaponManager.hardpointSets.Length; i++)
+                                    {
+                                        if (aircraft.weaponManager.hardpointSets[i] == hardpointSet)
+                                        {
+                                            stationIndex = i;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (stationIndex != -1)
+                                {
+                                    var dict = JsonLoadoutInjector.GetLoadout(acName, aircraft);
+                                    if (dict != null && dict.TryGetValue(stationIndex, out var customMounts))
+                                    {
+                                        if (customMounts != null && customMounts.Count > 0)
+                                        {
+                                            info.CustomMounts = customMounts;
+                                            if (verbose) LoadoutInjectorPlugin.ModLogger.LogInfo($"[InjectionPipeline] GetAvailableWeaponsNonAlloc: Discovered {customMounts.Count} custom mounts for station {stationIndex}. Caching result.");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _hsCache.Add(hardpointSet, info);
                     }
-                    __state = new PatchState { Set = hardpointSet, OriginalOptions = original };
-                    hardpointSet.weaponOptions = expanded;
+                    if (info.CustomMounts != null && info.CustomMounts.Count > 0)
+                    {
+                        List<WeaponMount> original = hardpointSet.weaponOptions ?? new List<WeaponMount>();
+                        JsonLoadoutInjector.PristineOptions(hardpointSet);
+                        List<WeaponMount> whitelist = JsonLoadoutInjector.BuildWhitelist(hardpointSet, info.CustomMounts);
+                        if (whitelist != null)
+                        {
+                            __state = new PatchState { Set = hardpointSet, OriginalOptions = original };
+                            hardpointSet.weaponOptions = whitelist;
+                        }
+                    }
+            }
+                catch (Exception ex)
+                {
+                    LoadoutInjectorPlugin.ModLogger.LogError("[InjectionPipeline] Prefix failed: " + ex);
                 }
             }
             static void Postfix(PatchState __state)
@@ -119,68 +123,70 @@ namespace LoadoutInjector
         {
             static void Prefix(object[] __args, out List<PatchState> __state)
             {
-                bool verbose = LoadoutInjectorPlugin.Cfg_DebugLogging?.Value == true;
-                if (verbose) LoadoutInjectorPlugin.ModLogger.LogInfo("[InjectionPipeline] VetLoadout Prefix(): Triggered.");
                 __state = null;
-                AircraftDefinition definition = null;
-                if (__args != null)
+                try
                 {
-                    for (int i = 0; i < __args.Length; i++)
+                    bool verbose = LoadoutInjectorPlugin.Cfg_DebugLogging?.Value == true;
+                    if (verbose) LoadoutInjectorPlugin.ModLogger.LogInfo("[InjectionPipeline] VetLoadout Prefix(): Triggered.");
+                    AircraftDefinition definition = null;
+                    if (__args != null)
                     {
-                        if (__args[i] is AircraftDefinition def)
+                        for (int i = 0; i < __args.Length; i++)
                         {
-                            definition = def;
-                            break;
-                        }
-                    }
-                }
-                if (definition == null || definition.unitPrefab == null)
-                {
-                    if (verbose) LoadoutInjectorPlugin.ModLogger.LogInfo("[InjectionPipeline] VetLoadout Prefix(): definition or unitPrefab is null. Returning.");
-                    return;
-                }
-                Aircraft aircraft = definition.unitPrefab.GetComponent<Aircraft>();
-                if (aircraft == null || aircraft.weaponManager == null || aircraft.weaponManager.hardpointSets == null)
-                {
-                    if (verbose) LoadoutInjectorPlugin.ModLogger.LogInfo("[InjectionPipeline] VetLoadout Prefix(): Aircraft or weaponManager is null. Returning.");
-                    return;
-                }
-                string acName = GetCachedAircraftName(aircraft);
-                if (verbose) LoadoutInjectorPlugin.ModLogger.LogInfo($"[InjectionPipeline] VetLoadout Prefix(): acName={acName}. Creating PatchState list.");
-                var hardpointSets = aircraft.weaponManager.hardpointSets;
-                bool stateInitialized = false;
-                var stations = JsonLoadoutInjector.GetLoadout(acName, aircraft);
-                if (stations != null && stations.Count > 0)
-                {
-                    for (int i = 0; i < hardpointSets.Length; i++)
-                    {
-                        HardpointSet hs = hardpointSets[i];
-                        if (hs == null) continue;
-                        if (stations.TryGetValue(i, out var customMounts))
-                        {
-                            if (customMounts != null && customMounts.Count > 0)
+                            if (__args[i] is AircraftDefinition def)
                             {
-                                if (verbose) LoadoutInjectorPlugin.ModLogger.LogInfo($"[InjectionPipeline] VetLoadout Prefix(): Found {customMounts.Count} custom mounts for station {i}. Injecting...");
-                                List<WeaponMount> original = hs.weaponOptions;
-                                if (original == null) original = new List<WeaponMount>();
-                                List<WeaponMount> expanded = new List<WeaponMount>(original);
-                                HashSet<int> seen = new HashSet<int>(original.Where(x => x != null).Select(x => x.GetInstanceID()));
-                                foreach (WeaponMount wm in customMounts)
-                                {
-                                    if (wm != null && seen.Add(wm.GetInstanceID()))
-                                        expanded.Add(wm);
-                                }
-                                if (!stateInitialized)
-                                {
-                                    __state = new List<PatchState>();
-                                    stateInitialized = true;
-                                }
-                                __state.Add(new PatchState { Set = hs, OriginalOptions = original });
-                                hs.weaponOptions = expanded;
-                                if (verbose) LoadoutInjectorPlugin.ModLogger.LogInfo($"[InjectionPipeline] VetLoadout Prefix(): Station {i} injection complete.");
+                                definition = def;
+                                break;
                             }
                         }
                     }
+                    if (definition == null || definition.unitPrefab == null)
+                    {
+                        if (verbose) LoadoutInjectorPlugin.ModLogger.LogInfo("[InjectionPipeline] VetLoadout Prefix(): definition or unitPrefab is null. Returning.");
+                        return;
+                    }
+                    Aircraft aircraft = definition.unitPrefab.GetComponent<Aircraft>();
+                    if (aircraft == null || aircraft.weaponManager == null || aircraft.weaponManager.hardpointSets == null)
+                    {
+                        if (verbose) LoadoutInjectorPlugin.ModLogger.LogInfo("[InjectionPipeline] VetLoadout Prefix(): Aircraft or weaponManager is null. Returning.");
+                        return;
+                    }
+                    string acName = GetCachedAircraftName(aircraft);
+                    if (verbose) LoadoutInjectorPlugin.ModLogger.LogInfo($"[InjectionPipeline] VetLoadout Prefix(): acName={acName}. Creating PatchState list.");
+                    var hardpointSets = aircraft.weaponManager.hardpointSets;
+                    bool stateInitialized = false;
+                    var stations = JsonLoadoutInjector.GetLoadout(acName, aircraft);
+                    if (stations != null && stations.Count > 0)
+                    {
+                        for (int i = 0; i < hardpointSets.Length; i++)
+                        {
+                            HardpointSet hs = hardpointSets[i];
+                            if (hs == null) continue;
+                            if (stations.TryGetValue(i, out var customMounts))
+                            {
+                                if (customMounts != null && customMounts.Count > 0)
+                                {
+                                    if (verbose) LoadoutInjectorPlugin.ModLogger.LogInfo($"[InjectionPipeline] VetLoadout Prefix(): Found {customMounts.Count} custom mounts for station {i}. Injecting...");
+                                    List<WeaponMount> original = hs.weaponOptions ?? new List<WeaponMount>();
+                                    JsonLoadoutInjector.PristineOptions(hs);
+                                    List<WeaponMount> whitelist = JsonLoadoutInjector.BuildWhitelist(hs, customMounts);
+                                    if (whitelist == null) continue;
+                                    if (!stateInitialized)
+                                    {
+                                        __state = new List<PatchState>();
+                                        stateInitialized = true;
+                                    }
+                                    __state.Add(new PatchState { Set = hs, OriginalOptions = original });
+                                    hs.weaponOptions = whitelist;
+                                    if (verbose) LoadoutInjectorPlugin.ModLogger.LogInfo($"[InjectionPipeline] VetLoadout Prefix(): Station {i} injection complete.");
+                                }
+                            }
+                        }
+                    }
+            }
+                catch (Exception ex)
+                {
+                    LoadoutInjectorPlugin.ModLogger.LogError("[InjectionPipeline] Prefix failed: " + ex);
                 }
             }
             static void Postfix(List<PatchState> __state)
